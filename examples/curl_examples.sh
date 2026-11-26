@@ -27,6 +27,17 @@ curl -sS -i -X POST "${BASE_URL}/api/v1/assessments" \
   -H 'Content-Type: application/json' \
   --data-binary @examples/request_blocked.json
 
+echo "== 月末批量试算：缺实测格退回（HTTP 422，只做 1 次可行性求解，不取界） =="
+curl -sS -i -X POST "${BASE_URL}/api/v1/assessments" \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/request_missing_measurement.json
+
+echo "== 补报实测后正常出数（HTTP 200，精确分数与达界见证表） =="
+curl -sS -X POST "${BASE_URL}/api/v1/assessments" \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/request_resupplied.json
+echo
+
 echo "== schedule conflict (HTTP 409) =="
 curl -sS -i -X POST "${BASE_URL}/api/v1/assessments" \
   -H 'Content-Type: application/json' \

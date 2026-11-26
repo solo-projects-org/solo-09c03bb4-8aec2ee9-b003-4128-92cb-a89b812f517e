@@ -13,6 +13,8 @@ from app.core import (
     ScheduleConflictError,
     assess,
     find_possible_positive_cells,
+    get_solver_stats,
+    reset_solver_stats,
 )
 from app.parsing import parse_assessment_request
 
@@ -311,6 +313,247 @@ class BruteForceOptimizationTests(unittest.TestCase):
         self.assertLess(elapsed, 3.0)
         self.assertLessEqual(result.minimum.difference, result.maximum.difference)
         self.assertEqual(sum(map(sum, result.minimum.schedule)), 100000)
+
+
+class SingleFeasibilitySolveTests(unittest.TestCase):
+    """每次请求最多一次排班可行性求解，以及单次求解的掩码正确性。"""
+
+    def _all_measured_period(self, m, n):
+        return PeriodMeasurements(
+            measured=tuple(tuple([1] * n) for _ in range(m)),
+            on_time=tuple(tuple([0] * n) for _ in range(m)),
+        )
+
+    def test_each_request_runs_at_most_one_feasibility_solve(self):
+        rng = random.Random(20261127)
+        for _ in range(80):
+            m = rng.randint(1, 3)
+            n = rng.randint(1, 3)
+            total = rng.randint(1, 6)
+            flat = [rng.randint(0, 3) for _ in range(m * n)]
+            flat[rng.randrange(len(flat))] += max(0, total - sum(flat))
+            table = [flat[i * n : (i + 1) * n] for i in range(m)]
+            row_totals = [sum(row) for row in table]
+            col_totals = [sum(table[i][j] for i in range(m)) for j in range(n)]
+            fixed = {
+                (i, j): table[i][j]
+                for i in range(m)
+                for j in range(n)
+                if rng.random() < 0.3
+            }
+            req = AssessmentRequest(
+                row_totals=tuple(row_totals),
+                column_totals=tuple(col_totals),
+                fixed_cells=fixed,
+                baseline=self._all_measured_period(m, n),
+                current=self._all_measured_period(m, n),
+            )
+            reset_solver_stats()
+            assess(req)
+            self.assertLessEqual(get_solver_stats()["feasibility_solves"], 1)
+
+    def test_missing_measurement_path_uses_one_solve_and_no_bound_solves(self):
+        payload = {
+            "row_totals": [2, 2],
+            "column_totals": [2, 2],
+            "baseline": {
+                "measured_shifts": [[4, 0], [2, 2]],
+                "on_time_shifts": [[3, 0], [1, 2]],
+            },
+            "current": {
+                "measured_shifts": [[0, 5], [2, 2]],
+                "on_time_shifts": [[0, 4], [2, 1]],
+            },
+        }
+        reset_solver_stats()
+        with self.assertRaises(MissingMeasurementError):
+            assess(parse_assessment_request(payload))
+        self.assertEqual(
+            get_solver_stats(),
+            {"feasibility_solves": 1, "min_cost_solves": 0},
+        )
+
+    def test_structural_conflict_uses_one_solve_and_arithmetic_conflict_none(self):
+        structural = {
+            "row_totals": [1, 1],
+            "column_totals": [2, 0],
+            "fixed_cells": [{"row": 0, "column": 0, "shifts": 0}],
+            "baseline": {
+                "measured_shifts": [[1, 0], [1, 0]],
+                "on_time_shifts": [[1, 0], [1, 0]],
+            },
+            "current": {
+                "measured_shifts": [[1, 0], [1, 0]],
+                "on_time_shifts": [[1, 0], [1, 0]],
+            },
+        }
+        reset_solver_stats()
+        with self.assertRaises(ScheduleConflictError):
+            assess(parse_assessment_request(structural))
+        self.assertEqual(get_solver_stats()["feasibility_solves"], 1)
+
+        arithmetic = {
+            "row_totals": [1, 1],
+            "column_totals": [1, 0],
+            "baseline": {
+                "measured_shifts": [[1, 0], [1, 0]],
+                "on_time_shifts": [[1, 0], [1, 0]],
+            },
+            "current": {
+                "measured_shifts": [[1, 0], [1, 0]],
+                "on_time_shifts": [[1, 0], [1, 0]],
+            },
+        }
+        reset_solver_stats()
+        with self.assertRaises(ScheduleConflictError):
+            assess(parse_assessment_request(arithmetic))
+        self.assertEqual(get_solver_stats()["feasibility_solves"], 0)
+
+    def test_single_solve_mask_matches_enumeration_exhaustively(self):
+        from app.core import analyze_schedule_feasibility
+
+        rng = random.Random(11)
+        checked = 0
+        for m in (1, 2, 3):
+            for n in (1, 2, 3):
+                for row_totals in itertools.product(range(0, 4), repeat=m):
+                    for col_totals in itertools.product(range(0, 4), repeat=n):
+                        if sum(row_totals) != sum(col_totals) or sum(row_totals) == 0:
+                            continue
+                        fixed = {
+                            (i, j): rng.randint(0, 2)
+                            for i in range(m)
+                            for j in range(n)
+                            if rng.random() < 0.4
+                        }
+                        req = AssessmentRequest(
+                            row_totals=row_totals,
+                            column_totals=col_totals,
+                            fixed_cells=fixed,
+                            baseline=self._all_measured_period(m, n),
+                            current=self._all_measured_period(m, n),
+                        )
+                        tables = enumerate_tables(row_totals, col_totals, fixed)
+                        if not tables:
+                            continue
+                        reset_solver_stats()
+                        analysis = analyze_schedule_feasibility(req)
+                        self.assertTrue(analysis.feasible)
+                        brute_mask = [
+                            [any(t[i][j] > 0 for t in tables) for j in range(n)]
+                            for i in range(m)
+                        ]
+                        self.assertEqual(analysis.possible_positive, brute_mask)
+                        # 残量为 0（全固定表）时无需任何最大流；其余情形恰好 1 次。
+                        self.assertLessEqual(
+                            get_solver_stats()["feasibility_solves"], 1
+                        )
+                        checked += 1
+        self.assertGreater(checked, 200)
+
+    def test_impossible_unknown_cells_are_pruned_without_changing_bounds(self):
+        # 第 2 行残量为 0、第 2 列残量为 0：未知格 (1,*)、(*,1) 恒为 0。
+        payload = {
+            "row_totals": [2, 0],
+            "column_totals": [1, 1],
+            "fixed_cells": [{"row": 0, "column": 0, "shifts": 1}],
+            "baseline": {
+                "measured_shifts": [[4, 2], [3, 4]],
+                "on_time_shifts": [[3, 1], [1, 2]],
+            },
+            "current": {
+                "measured_shifts": [[2, 5], [2, 2]],
+                "on_time_shifts": [[1, 4], [2, 1]],
+            },
+        }
+        req = parse_assessment_request(payload)
+        possible = find_possible_positive_cells(req)
+        self.assertEqual(possible, [[True, True], [False, False]])
+
+        result = assess(req)
+        # 见证表从不使用被判定为不可能的格。
+        for bound in (result.minimum, result.maximum):
+            table = bound.schedule
+            self.assertEqual(table[1], [0, 0])
+            self.assertEqual(table[0][1] + table[1][1], 1)
+            self.assertEqual([sum(r) for r in table], [2, 0])
+            self.assertEqual(
+                [sum(table[i][j] for i in range(2)) for j in range(2)], [1, 1]
+            )
+
+        # 与穷举结果一致。
+        coefficients = [
+            [
+                Fraction(req.current.on_time[i][j], req.current.measured[i][j])
+                - Fraction(req.baseline.on_time[i][j], req.baseline.measured[i][j])
+                for j in range(2)
+            ]
+            for i in range(2)
+        ]
+        feasible = enumerate_tables(req.row_totals, req.column_totals, req.fixed_cells)
+        brute = sorted(
+            sum(
+                (Fraction(t[i][j]) * coefficients[i][j] for i in range(2) for j in range(2)),
+                Fraction(0),
+            )
+            / 2
+            for t in feasible
+        )
+        self.assertEqual(result.minimum.difference, brute[0])
+        self.assertEqual(result.maximum.difference, brute[-1])
+
+    def test_resupplying_measurement_flips_rejection_into_exact_result(self):
+        missing_payload = {
+            "row_totals": [2, 2],
+            "column_totals": [2, 2],
+            "baseline": {
+                "measured_shifts": [[4, 4], [4, 4]],
+                "on_time_shifts": [[3, 2], [1, 2]],
+            },
+            "current": {
+                "measured_shifts": [[0, 5], [4, 4]],
+                "on_time_shifts": [[0, 4], [3, 1]],
+            },
+        }
+        with self.assertRaises(MissingMeasurementError) as ctx:
+            assess(parse_assessment_request(missing_payload))
+        self.assertEqual(
+            {(c["row"], c["column"]) for c in ctx.exception.blocked_cells},
+            {(0, 0)},
+        )
+
+        resupplied = dict(missing_payload)
+        resupplied["current"] = {
+            "measured_shifts": [[4, 5], [4, 4]],
+            "on_time_shifts": [[2, 4], [3, 1]],
+        }
+        req = parse_assessment_request(resupplied)
+        coefficients = [
+            [
+                Fraction(req.current.on_time[i][j], req.current.measured[i][j])
+                - Fraction(req.baseline.on_time[i][j], req.baseline.measured[i][j])
+                for j in range(2)
+            ]
+            for i in range(2)
+        ]
+        feasible = enumerate_tables(req.row_totals, req.column_totals, req.fixed_cells)
+        brute = sorted(
+            sum(
+                (Fraction(t[i][j]) * coefficients[i][j] for i in range(2) for j in range(2)),
+                Fraction(0),
+            )
+            / 4
+            for t in feasible
+        )
+        result = assess(req)
+        self.assertEqual(result.minimum.difference, brute[0])
+        self.assertEqual(result.maximum.difference, brute[-1])
+        reset_solver_stats()
+        assess(req)
+        self.assertEqual(
+            get_solver_stats(),
+            {"feasibility_solves": 1, "min_cost_solves": 2},
+        )
 
 
 if __name__ == "__main__":

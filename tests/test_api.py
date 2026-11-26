@@ -96,6 +96,60 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertEqual(response.json()["status"], "invalid_request")
 
+    def test_missing_then_resupplied_measurement_flow_via_alias(self):
+        missing_payload = {
+            "row_labels": ["线路一", "线路二"],
+            "column_labels": ["高峰", "平峰"],
+            "row_totals": [2, 2],
+            "column_totals": [2, 2],
+            "baseline": {
+                "measured_shifts": [[4, 4], [4, 4]],
+                "on_time_shifts": [[3, 2], [1, 2]],
+            },
+            "current": {
+                "measured_shifts": [[0, 5], [4, 4]],
+                "on_time_shifts": [[0, 4], [3, 1]],
+            },
+        }
+        # 缺报：所有别名路径都应原样 422 退回，且不返回取界结果。
+        for path in ["/api/v1/assessments", "/api/v1/evaluate", "/evaluate"]:
+            response = _CLIENT.post(path, json=missing_payload)
+            self.assertEqual(response.status_code, 422, response.text)
+            body = response.json()
+            self.assertEqual(body["status"], "missing_measurements")
+            self.assertEqual(
+                {(x["row"], x["column"]) for x in body["blocked_cells"]},
+                {(0, 0)},
+            )
+            self.assertEqual(body["blocked_cells"][0]["missing_in"], ["current"])
+            self.assertFalse(body["result_available"])
+            self.assertNotIn("minimum", body)
+
+        # 补报后同一请求正常出数，响应格式保持不变。
+        resupplied = dict(missing_payload)
+        resupplied["current"] = {
+            "measured_shifts": [[4, 5], [4, 4]],
+            "on_time_shifts": [[2, 4], [3, 1]],
+        }
+        response = _CLIENT.post("/api/v1/assessments", json=resupplied)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["status"], "ok")
+        self.assertEqual(body["total_scheduled_shifts"], 4)
+        self.assertEqual(body["blocked_cells"], [])
+        for key in ["minimum", "maximum", "min", "max", "min_table", "max_table"]:
+            self.assertIn(key, body)
+        self.assertEqual(body["minimum"]["fraction"], body["min_value"])
+        self.assertEqual(body["maximum"]["fraction"], body["max_value"])
+        # 见证表满足行列合计且为非负整数。
+        for table in (body["minimum"]["schedule"], body["maximum"]["schedule"]):
+            self.assertEqual([sum(r) for r in table], [2, 2])
+            self.assertEqual(
+                [sum(table[i][j] for i in range(2)) for j in range(2)], [2, 2]
+            )
+            self.assertTrue(all(value >= 0 for row in table for value in row))
+            self.assertTrue(all(isinstance(value, int) for row in table for value in row))
+
 
 if __name__ == "__main__":
     unittest.main()

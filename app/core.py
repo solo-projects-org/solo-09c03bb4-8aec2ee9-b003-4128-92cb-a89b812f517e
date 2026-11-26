@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fractions import Fraction
-from typing import Iterable
 
 MAX_DIM = 6
 MIN_TOTAL = 1
 MAX_TOTAL = 100_000
+
+# 自测与核对用的求解计数：feasibility_solves 统计排班可行性最大流次数，
+# min_cost_solves 统计上下界费用流次数（一次取界含最小/最大两次）。
+SOLVER_STATS = {"feasibility_solves": 0, "min_cost_solves": 0}
+
+
+def reset_solver_stats() -> None:
+    SOLVER_STATS["feasibility_solves"] = 0
+    SOLVER_STATS["min_cost_solves"] = 0
+
+
+def get_solver_stats() -> dict[str, int]:
+    return dict(SOLVER_STATS)
 
 
 class AssessmentError(Exception):
@@ -161,6 +173,12 @@ def fraction_dict(value: Fraction) -> dict:
 
 # ---------------------------------------------------------------------------
 # Flow feasibility
+#
+# 月末批量试算时，调用方会反复尝试给未知格补 1 班来寻找需要补报实测的格。
+# 旧实现对每个未知格单独跑一次“强制至少 1 班”的最大流（最多 m*n 次）。
+# 现在整次请求只构造并求解一次残量运输网络：可行性由该最大流判定，
+# “哪些格能在至少一张可行表中排到班次”直接从同一张残量图的可达性读出，
+# 不再逐格发起排班可行性求解。
 # ---------------------------------------------------------------------------
 
 
@@ -169,11 +187,12 @@ class _Dinic:
         self.n = n
         self.graph: list[list[list[int]]] = [[] for _ in range(n)]
 
-    def add_edge(self, source: int, target: int, capacity: int) -> None:
+    def add_edge(self, source: int, target: int, capacity: int):
         forward = [target, len(self.graph[target]), capacity]
         backward = [source, len(self.graph[source]), 0]
         self.graph[source].append(forward)
         self.graph[target].append(backward)
+        return forward
 
     def max_flow(self, source: int, sink: int) -> int:
         flow = 0
@@ -214,25 +233,64 @@ class _Dinic:
                 flow += pushed
 
 
-def residual_feasible(
-    m: int,
-    n: int,
-    row_residual: SequenceLikeInt,
-    col_residual: SequenceLikeInt,
-    allowed: Iterable[tuple[int, int]],
-) -> bool:
-    """Check an integer transportation matrix on the allowed cell graph."""
-    row_residual = tuple(row_residual)
-    col_residual = tuple(col_residual)
-    if any(x < 0 for x in row_residual) or any(x < 0 for x in col_residual):
-        return False
-    row_sum = sum(row_residual)
-    col_sum = sum(col_residual)
-    if row_sum != col_sum:
-        return False
-    if row_sum == 0:
-        return True
+@dataclass
+class FeasibilityAnalysis:
+    """一次最大流求解的全部复用产物。"""
 
+    feasible: bool
+    row_residual: list[int]
+    col_residual: list[int]
+    unknown_cells: list[tuple[int, int]]
+    possible_positive: list[list[bool]]
+
+
+def _residuals(request: AssessmentRequest) -> tuple[list[int], list[int]]:
+    row_residual = list(request.row_totals)
+    col_residual = list(request.column_totals)
+    for (i, j), value in request.fixed_cells.items():
+        row_residual[i] -= value
+        col_residual[j] -= value
+    return row_residual, col_residual
+
+
+def analyze_schedule_feasibility(request: AssessmentRequest) -> FeasibilityAnalysis:
+    """至多运行一次排班可行性最大流，并同时求出“可能为正”的格掩码。
+
+    判定依据（整数运输网络）：
+    - 网络从源点到行、再经未知格边到列、最后到汇点推送全部残量班次；
+      最大流达到残量总和当且仅当存在至少一张可行排班表。
+    - 对一条未知格边 (row i -> col j)，它能在某张可行表中带正流量，当且仅当
+      该边已有正流量，或者在同一最大流的残量图上 col j 可以到达 row i
+      （沿残量边形成增广圈，沿圈调整即可把流量引入该边且保持整数性）。
+    """
+    m = len(request.row_totals)
+    n = len(request.column_totals)
+    row_residual, col_residual = _residuals(request)
+
+    unknown_cells = [
+        (i, j)
+        for i in range(m)
+        for j in range(n)
+        if (i, j) not in request.fixed_cells
+    ]
+    possible = [[False] * n for _ in range(m)]
+    for (i, j), value in request.fixed_cells.items():
+        if value > 0:
+            possible[i][j] = True
+
+    if any(x < 0 for x in row_residual) or any(x < 0 for x in col_residual):
+        return FeasibilityAnalysis(False, row_residual, col_residual, unknown_cells, possible)
+
+    residual_total = sum(row_residual)
+    if residual_total != sum(col_residual):
+        return FeasibilityAnalysis(False, row_residual, col_residual, unknown_cells, possible)
+
+    if residual_total == 0:
+        # 无残量可排：唯一可行表由固定格完全决定，未知格恒为 0。
+        # 这种情形不需要任何最大流求解。
+        return FeasibilityAnalysis(True, row_residual, col_residual, unknown_cells, possible)
+
+    SOLVER_STATS["feasibility_solves"] += 1
     source = 0
     row_start = 1
     col_start = row_start + m
@@ -246,16 +304,41 @@ def residual_feasible(
         if amount:
             dinic.add_edge(col_start + j, sink, amount)
 
-    allowed_set = set(allowed)
-    capacity = row_sum
-    for i, j in allowed_set:
-        dinic.add_edge(row_start + i, col_start + j, capacity)
+    cell_edges: dict[tuple[int, int], list[int]] = {}
+    for i, j in unknown_cells:
+        edge = dinic.add_edge(row_start + i, col_start + j, residual_total)
+        cell_edges[(i, j)] = edge
 
-    return dinic.max_flow(source, sink) == row_sum
+    flow = dinic.max_flow(source, sink)
+    if flow != residual_total:
+        return FeasibilityAnalysis(False, row_residual, col_residual, unknown_cells, possible)
 
+    # 只在列侧残量网络上做 BFS：列节点只能沿格边/格边反向在行列节点间移动，
+    # 永远到不了源点，因此源/汇边不会干扰可达关系。
+    reachable_from_col: list[frozenset[int] | None] = [None] * n
 
-# Type alias kept simple without importing typing.Sequence at runtime issues.
-SequenceLikeInt = tuple[int, ...] | list[int]
+    def reachable_set(start_col: int) -> frozenset[int]:
+        cached = reachable_from_col[start_col]
+        if cached is not None:
+            return cached
+        seen = {col_start + start_col}
+        queue = deque([col_start + start_col])
+        while queue:
+            v = queue.popleft()
+            for to, _rev, cap in dinic.graph[v]:
+                if cap > 0 and to not in seen:
+                    seen.add(to)
+                    queue.append(to)
+        result = frozenset(seen)
+        reachable_from_col[start_col] = result
+        return result
+
+    for (i, j), edge in cell_edges.items():
+        used = residual_total - edge[2]
+        if used > 0 or (row_start + i) in reachable_set(j):
+            possible[i][j] = True
+
+    return FeasibilityAnalysis(True, row_residual, col_residual, unknown_cells, possible)
 
 
 # ---------------------------------------------------------------------------
@@ -365,11 +448,9 @@ class _MinCostFlow:
 # ---------------------------------------------------------------------------
 
 
-def validate_schedule_shape(request: AssessmentRequest) -> list[dict]:
-    """Return structured schedule conflicts; an empty list means feasible."""
+def _arithmetic_conflicts(request: AssessmentRequest) -> list[dict]:
+    """纯算术类冲突检查，不触发任何排班可行性求解。"""
     conflicts: list[dict] = []
-    m = len(request.row_totals)
-    n = len(request.column_totals)
 
     row_sum = sum(request.row_totals)
     col_sum = sum(request.column_totals)
@@ -432,97 +513,61 @@ def validate_schedule_shape(request: AssessmentRequest) -> list[dict]:
                 }
             )
 
-    # If arithmetic already fails, no useful residual flow test exists.
+    return conflicts
+
+
+def _residual_conflict_detail(analysis: FeasibilityAnalysis) -> dict:
+    return {
+        "code": "residual_transportation_infeasible",
+        "message": "扣除已知格后，剩余行列合计无法由未知格的非负整数班次数拼成。",
+        "row_residual_totals": analysis.row_residual,
+        "column_residual_totals": analysis.col_residual,
+        "unknown_cells": [
+            {
+                "row": i,
+                "column": j,
+                "col": j,
+                "i": i,
+                "j": j,
+                "row_index": i,
+                "column_index": j,
+                "row_number": i + 1,
+                "column_number": j + 1,
+            }
+            for i, j in analysis.unknown_cells
+        ],
+    }
+
+
+def validate_schedule_shape(request: AssessmentRequest) -> list[dict]:
+    """Return structured schedule conflicts; an empty list means feasible.
+
+    整个检查只允许触发一次排班可行性求解（见
+    :func:`analyze_schedule_feasibility`）：算术类冲突直接判定，结构可行性
+    与“可能为正”的格集合共享同一次最大流的结果。
+    """
+    conflicts = _arithmetic_conflicts(request)
+
+    # If arithmetic already fails, no residual flow test is needed (and the
+    # request performs zero feasibility solves on this rejection path).
     if conflicts:
         return conflicts
 
-    row_residual = list(request.row_totals)
-    col_residual = list(request.column_totals)
-    for (i, j), value in request.fixed_cells.items():
-        row_residual[i] -= value
-        col_residual[j] -= value
-
-    unknown_cells = [
-        (i, j)
-        for i in range(m)
-        for j in range(n)
-        if (i, j) not in request.fixed_cells
-    ]
-
-    if not residual_feasible(m, n, row_residual, col_residual, unknown_cells):
-        conflicts.append(
-            {
-                "code": "residual_transportation_infeasible",
-                "message": "扣除已知格后，剩余行列合计无法由未知格的非负整数班次数拼成。",
-                "row_residual_totals": row_residual,
-                "column_residual_totals": col_residual,
-                "unknown_cells": [
-                    {
-                        "row": i,
-                        "column": j,
-                        "col": j,
-                        "i": i,
-                        "j": j,
-                        "row_index": i,
-                        "column_index": j,
-                        "row_number": i + 1,
-                        "column_number": j + 1,
-                    }
-                    for i, j in unknown_cells
-                ],
-            }
-        )
+    analysis = analyze_schedule_feasibility(request)
+    if not analysis.feasible:
+        conflicts.append(_residual_conflict_detail(analysis))
 
     return conflicts
 
 
-def can_cell_be_positive(
-    request: AssessmentRequest,
-    row_residual: list[int],
-    col_residual: list[int],
-    cell: tuple[int, int],
-) -> bool:
-    i, j = cell
-    if row_residual[i] <= 0 or col_residual[j] <= 0:
-        return False
-
-    adjusted_rows = row_residual.copy()
-    adjusted_cols = col_residual.copy()
-    adjusted_rows[i] -= 1
-    adjusted_cols[j] -= 1
-
-    m = len(request.row_totals)
-    n = len(request.column_totals)
-    unknown_cells = [
-        (r, c)
-        for r in range(m)
-        for c in range(n)
-        if (r, c) not in request.fixed_cells
-    ]
-    return residual_feasible(m, n, adjusted_rows, adjusted_cols, unknown_cells)
-
-
 def find_possible_positive_cells(request: AssessmentRequest) -> list[list[bool]]:
-    m = len(request.row_totals)
-    n = len(request.column_totals)
-    possible = [[False] * n for _ in range(m)]
-
-    row_residual = list(request.row_totals)
-    col_residual = list(request.column_totals)
-    for (i, j), value in request.fixed_cells.items():
-        row_residual[i] -= value
-        col_residual[j] -= value
-        if value > 0:
-            possible[i][j] = True
-
-    for i in range(m):
-        for j in range(n):
-            if (i, j) in request.fixed_cells:
-                continue
-            if can_cell_be_positive(request, row_residual, col_residual, (i, j)):
-                possible[i][j] = True
-
-    return possible
+    """返回每个格能否在至少一张可行排班表中排到班次（单次可行性求解）。"""
+    analysis = analyze_schedule_feasibility(request)
+    if not analysis.feasible:
+        m = len(request.row_totals)
+        n = len(request.column_totals)
+        return [[False] * n for _ in range(m)]
+    return analysis.possible_positive
 
 
 def _cell_rate_difference(request: AssessmentRequest, i: int, j: int) -> Fraction:
@@ -540,6 +585,7 @@ def _extreme_schedule(
     request: AssessmentRequest,
     coefficients: list[list[Fraction]],
     minimize: bool,
+    possible: list[list[bool]] | None = None,
 ) -> tuple[list[list[int]], Fraction]:
     m = len(request.row_totals)
     n = len(request.column_totals)
@@ -551,12 +597,22 @@ def _extreme_schedule(
         row_residual[i] -= value
         col_residual[j] -= value
 
-    unknown_cells = [
-        (i, j)
-        for i in range(m)
-        for j in range(n)
-        if (i, j) not in request.fixed_cells
-    ]
+    # 实测足够出数后，把已确定排不到班的未知格直接从上下界费用流中剔除。
+    # 这些格在所有可行表中恒为 0，删除对应边不改变极值，只缩小求解规模。
+    if possible is None:
+        unknown_cells = [
+            (i, j)
+            for i in range(m)
+            for j in range(n)
+            if (i, j) not in request.fixed_cells
+        ]
+    else:
+        unknown_cells = [
+            (i, j)
+            for i in range(m)
+            for j in range(n)
+            if (i, j) not in request.fixed_cells and possible[i][j]
+        ]
     residual_total = sum(row_residual)
 
     source = 0
@@ -577,6 +633,7 @@ def _extreme_schedule(
         edge_refs[(i, j)] = edge
 
     sent, flow_cost = mcf.min_cost_flow(source, sink, residual_total)
+    SOLVER_STATS["min_cost_solves"] += 1
     if sent != residual_total:
         # validate_schedule_shape should have caught this before optimization.
         raise ScheduleConflictError(
@@ -639,10 +696,6 @@ def _rates_for_table(
 
 
 def assess(request: AssessmentRequest) -> AssessmentResult:
-    conflicts = validate_schedule_shape(request)
-    if conflicts:
-        raise ScheduleConflictError("排班记录不一致，无法构造任何符合条件的排班表。", conflicts)
-
     total = sum(request.row_totals)
     if not (MIN_TOTAL <= total <= MAX_TOTAL):
         # Parsing normally checks this, but keep the domain boundary explicit.
@@ -651,7 +704,21 @@ def assess(request: AssessmentRequest) -> AssessmentResult:
             [{"code": "total_out_of_range", "total": total}],
         )
 
-    possible = find_possible_positive_cells(request)
+    arithmetic = _arithmetic_conflicts(request)
+    if arithmetic:
+        # 算术已失败时无需也无法构造残量网络，本路径不产生可行性求解。
+        raise ScheduleConflictError(
+            "排班记录不一致，无法构造任何符合条件的排班表。", arithmetic
+        )
+
+    # 整次请求唯一一次排班可行性求解：可行性判定与“可能为正”格掩码同源复用。
+    analysis = analyze_schedule_feasibility(request)
+    if not analysis.feasible:
+        raise ScheduleConflictError(
+            "排班记录不一致，无法构造任何符合条件的排班表。",
+            [_residual_conflict_detail(analysis)],
+        )
+    possible = analysis.possible_positive
 
     blocked: list[dict] = []
     for i in range(len(request.row_totals)):
@@ -691,6 +758,8 @@ def assess(request: AssessmentRequest) -> AssessmentResult:
                 blocked.append(item)
 
     if blocked:
+        # 缺实测退回发生在率差取界（费用流）之前：本路径只做了 1 次可行性
+        # 求解，0 次取界求解。
         raise MissingMeasurementError(
             "存在可能排有班次但某一期没有实测班次的格；为避免无依据加权，本次不出数。",
             blocked,
@@ -703,8 +772,10 @@ def assess(request: AssessmentRequest) -> AssessmentResult:
         for i in range(m)
     ]
 
-    min_table, min_sum = _extreme_schedule(request, coefficients, minimize=True)
-    max_table, max_sum = _extreme_schedule(request, coefficients, minimize=False)
+    # 实测足够出数：把确定排不到班的未知格从上下界费用流中剔除，
+    # 极值与见证表保持精确（这些格在所有可行表中恒为 0）。
+    min_table, min_sum = _extreme_schedule(request, coefficients, True, possible)
+    max_table, max_sum = _extreme_schedule(request, coefficients, False, possible)
 
     min_diff = min_sum / total
     max_diff = max_sum / total
