@@ -1,0 +1,17 @@
+{
+  "row_labels": ["线路一", "线路二"],
+  "column_labels": ["只能填 2 班的列", "合计为 0 的列"],
+  "row_totals": [1, 1],
+  "column_totals": [2, 0],
+  "fixed_cells": [
+    {"row": 0, "column": 0, "shifts": 0}
+  ],
+  "baseline": {
+    "measured_shifts": [[1, 0], [1, 0]],
+    "on_time_shifts": [[1, 0], [1, 0]]
+  },
+  "current": {
+    "measured_shifts": [[1, 0], [1, 0]],
+    "on_time_shifts": [[1, 0], [1, 0]]
+  }
+}

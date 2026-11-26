@@ -1,0 +1,14 @@
+{
+  "row_labels": ["线路一", "线路二"],
+  "column_labels": ["高峰", "平峰"],
+  "row_totals": [2, 2],
+  "column_totals": [2, 2],
+  "baseline": {
+    "measured_shifts": [[4, 0], [2, 2]],
+    "on_time_shifts": [[3, 0], [1, 2]]
+  },
+  "current": {
+    "measured_shifts": [[0, 5], [2, 2]],
+    "on_time_shifts": [[0, 4], [2, 1]]
+  }
+}

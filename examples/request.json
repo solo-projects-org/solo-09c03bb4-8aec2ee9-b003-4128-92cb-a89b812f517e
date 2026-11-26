@@ -1,0 +1,18 @@
+{
+  "row_labels": ["干线", "支线", "微循环"],
+  "column_labels": ["早高峰", "晚高峰"],
+  "row_totals": [2, 2, 2],
+  "column_totals": [3, 3],
+  "total_shifts": 6,
+  "fixed_cells": [
+    {"row": 0, "column": 1, "shifts": 2}
+  ],
+  "baseline": {
+    "measured_shifts": [[2, 2], [2, 2], [2, 2]],
+    "on_time_shifts": [[1, 1], [1, 1], [1, 1]]
+  },
+  "current": {
+    "measured_shifts": [[2, 2], [2, 2], [2, 2]],
+    "on_time_shifts": [[1, 1], [2, 1], [1, 2]]
+  }
+}

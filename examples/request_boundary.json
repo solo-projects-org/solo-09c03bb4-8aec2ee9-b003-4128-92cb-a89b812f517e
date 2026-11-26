@@ -1,0 +1,17 @@
+{
+  "row_labels": ["唯一线路类别"],
+  "column_labels": ["唯一时段"],
+  "row_totals": [100000],
+  "column_totals": [100000],
+  "fixed_cells": [
+    {"row_index": 0, "column_index": 0, "shifts": 100000}
+  ],
+  "baseline": {
+    "measured_shifts": [[3]],
+    "on_time_shifts": [[1]]
+  },
+  "current": {
+    "measured_shifts": [[7]],
+    "on_time_shifts": [[6]]
+  }
+}
